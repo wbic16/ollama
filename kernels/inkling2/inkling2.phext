@@ -1,0 +1,339 @@
+# Inkling-2-Mini — a virtualized kernel declaration
+
+This artifact declares how the Inkling-2-Mini transformer block
+behaves, and carries the implementations of that behavior that exist.
+It is the first instance of the unified-backend design: the
+declaration and at least one implementation travel together, encoded
+in multiversal phext, and a runner inflates the platform kernel it is
+missing from the declaration plus whichever implementations it can
+execute.
+
+The model: Inkling-2-Mini, Thinking Machines, Apache 2.0 open
+weights, released 2026-11-20. Architecture name in the artifact and
+the runner: Inkling2LoopForConditionalGeneration (model_type
+inkling2_loop). 26.4B parameters total, 3.4B active per token, 5.4B
+effective weight activations once the loop's reuse is counted
+(publisher's figures, model card).
+
+Coordinate map of this artifact:
+  1.1.1/1.1.1/1.1.1  this scroll — home and map
+  1.1.1/1.1.1/1.1.2  declaration: structure and shapes
+  1.1.1/1.1.1/1.1.3  declaration: the loop
+  1.1.1/1.1.1/1.1.4  declaration: attention
+  1.1.1/1.1.1/1.1.5  declaration: mixture of experts
+  1.1.1/1.1.1/1.1.6  declaration: precision and dequantization
+  1.1.1/1.1.1/1.1.7  declaration: residual mixing
+  1.1.1/1.2.1/1.1.1  implementation: the published MLX runner
+  1.1.1/1.2.1/1.1.2  implementation: Linux CPU, this fork's patch
+  1.1.1/1.2.1/1.1.3  run record: first inflation
+
+Provenance: every number in the declaration scrolls was read from the
+released weights artifact (config.json, hf_quant_config.json,
+model.safetensors.index.json; SHA-256 verified against the
+publisher's tree, 2026-11-21) or from this fork's runner source at
+upstream HEAD 2bd4d6aabdf4caa39e7095e201dcda4cc1a3a406. Nothing here
+is copied from marketing copy where the artifact itself speaks.
+# Declaration — structure and shapes
+
+Text tower (all dimensions from config.json):
+  hidden_size            2304
+  physical layers        24
+  vocabulary             201024 (unpadded 200058)
+  context length         1048576 (model_max_length)
+  embedding              bf16, with its own norm
+  unembedding            bf16 weights, float32 forward output
+  end of sequence        token 200006
+
+A forward pass is NOT 24 layer applications. Twelve of the
+twenty-four layers sit inside a loop core and are applied three
+times per token; the pass is 48 layer visits. The loop is declared
+in scroll 1.1.1/1.1.1/1.1.3; it is graph structure, not a runtime
+option: the same physical weights are re-applied, and each visit
+owns separate cache state.
+
+The artifact is multimodal: a vision tower is declared in the same
+config (temporal_patch 2, native_patch 20, adapter_merge 2). This
+declaration covers the text tower and the looped block, which is the
+kernel the unified backend must inflate; the vision tower's behavior
+is carried by the reference implementation's source and is not
+re-declared here yet.
+
+A multi-token-prediction draft head ships alongside (mtp.safetensors,
+all bf16: a fused projection plus DFlare draft layers). It is an
+optional speculation accelerator over this same block, not part of
+the block's definition.
+# Declaration — the loop
+
+loop_config (from config.json):
+  core_start    6
+  core_end      18
+  num_passes    3
+  gate_rank     64
+  is_varloop    false
+
+Execution plan (the runner's executionPlan states it exactly):
+  1. Apply layers [0, core_end) once: layers 0..17.
+  2. For passes 2..num_passes, re-apply layers [core_start, core_end):
+     layers 6..17, twice more.
+  3. Apply layers [core_end, num_layers): layers 18..23.
+Total layer visits per token: 18 + 12 + 12 + 6 = 48.
+
+State rules:
+  - A layer visit owns its own attention and convolution cache
+    slots. Several visits can use the same physical layer's weights;
+    they never share cache. Key/value state is therefore per-visit:
+    the loop multiplies cache by the pass count for core layers, it
+    does not amortize it.
+  - Looping is only defined when the core boundaries align with
+    residual blocks (n_layers_per_attn_res_block = 6; 6 and 18 are
+    both block boundaries) and when residual values are normalized
+    (attn_res_normalize_values = true). A config that violates
+    either condition is not a looped model under this declaration.
+  - Variable loop counts (is_varloop) are not supported by the
+    reference runner and are outside this declaration.
+  - At the first visit of a new pass (visit.layer == loop start),
+    the residual stream passes through the loop's residual-mixing
+    gate (gate_rank 64) before the layer applies. Declared in
+    scroll 1.1.1/1.1.1/1.1.7.
+# Declaration — attention
+
+Per layer (from config.json):
+  attention heads        24
+  key/value heads        8 (grouped-query attention)
+  head_dim               128
+  q_bias, o_bias         false
+  rms_norm_eps           1e-6
+  use_value_norm_no_gamma  true
+
+Hybrid pattern: twenty layers are LOCAL, four are GLOBAL.
+  local_layer_ids: every layer except 5, 11, 17, 23
+  global layers:   5, 11, 17, 23 — one per 6-layer residual block
+Local layers attend inside a sliding window of 1024 tokens
+(sliding_window_size); global layers attend without the window.
+Local and global layers carry separate head counts in the config's
+swa fields (also 24 query / 8 key-value, head_dim 128).
+
+Relative position and scaling behavior:
+  d_rel                  16 (learned relative-position features)
+  rel_extent             1024
+  sconv_kernel_size      4 (short convolution in the block)
+  qk_l2_clip_threshold   22.627
+  rel_l2_clip            8.0
+  log_scaling_n_floor    8192
+  alpha                  0.1
+  final_logit_softcapping  30.0 (declared with the block; applied
+                             at the unembedding)
+# Declaration — mixture of experts
+
+Every layer's feed-forward is a mixture of experts (from config.json):
+  n_routed_experts       128
+  num_experts_per_tok    8 (top-8 routing per token)
+  n_shared_experts       0
+  expert intermediate    1152 (w13 fused gate+up, w2 down)
+  use_gate_bias          true
+  route_scale            8.0
+  mlp_gate_softcap       4.0
+  mlp_up_softcap         25.0
+
+Routing rule: the gate scores all 128 experts, applies its learned
+bias, scales by route_scale, and selects the top 8; only those
+experts' weights are read for the token. Active parameters per token
+are 3.4B of 26.4B total; counting the loop's re-application of core
+layers, effective weight activations are 5.4B per token.
+
+Implementation note carried by the declaration: on GPU kernels the
+runner routes tokens as sorted runs per expert (one launch per run);
+on a backend without those kernels the same selection is computed
+with ordinary graph operations. The selection rule is identical;
+only the schedule differs. Expert weights are stored fused and
+quantized — see the precision scroll, 1.1.1/1.1.1/1.1.6.
+# Declaration — precision and dequantization
+
+The checkpoint is trained and shipped quantized. No higher-precision
+master weights exist: the quantized form IS the released precision,
+and any conversion is a one-way widening of the same numbers, never
+an upgrade. (Publisher's statement, confirmed by the artifact: the
+safetensors hold only the forms below.)
+
+Expert weights (from hf_quant_config.json):
+  Layers 0-19 — NVFP4
+    weight_transform     nvfp4_nearest
+    weight_block_shape   [1, 16] — one scale per 16 values
+    values               E2M1 (4-bit float)
+    scales               float8_e4m3fn, format amax_denominator
+    activation quant     per-token amax, block 16, format nvfp4_e2m1,
+                         rounding nearest, scale selection
+                         fouroversix_mae
+  Layers 20-23 — MXFP8
+    weight_transform     mxfp8_nearest
+    weight_block_shape   [32, 32]
+    values               E4M3 (8-bit float)
+    scales               ue8m0 (power-of-two scales)
+    activation quant     block 32, format mxfp8_e4m3, rounding nearest
+
+Everything else is unquantized: attention, embeddings, norms and the
+residual-mixing parameters in bf16 (the attention-residual group
+computes and outputs in float32); the unembedding in bf16; the MTP
+draft head entirely in bf16.
+
+Dequantization rule (the only rule an implementation may use):
+  NVFP4:  w = E2M1(code) * E4M3(scale)        per 16-value group
+  MXFP8:  w = E4M3(code) * 2^(ue8m0 scale)    per 32x32 block
+The runner's shared quant facts (mlx/quant in this fork) fix the
+group sizes: nvfp4 groupSize 16, 4 bits; mxfp8 groupSize 32, 8 bits.
+An implementation may dequantize inside its matmul kernel or ahead
+of time into a wider format; both are the same declaration. What it
+may not do is silently substitute a different quantization of the
+weights — a requantized checkpoint is a different artifact, not an
+implementation of this one.
+# Declaration — residual mixing
+
+The block's residual stream is managed in blocks of six layers
+(n_layers_per_attn_res_block = 6; four blocks across 24 layers).
+Each block carries learned attention-residual parameters
+(attn_queries per block, in the float32 parameter group) that mix
+earlier block outputs into the stream; residual values are
+normalized before mixing (attn_res_normalize_values = true).
+
+The loop interacts with the mixing at pass boundaries: when a new
+pass begins (a visit whose layer equals the loop core start), the
+runner applies dedicated loop-start handling that re-mixes the
+residual stream through a low-rank gate (gate_rank = 64) before the
+core layers re-apply. This is part of the block's behavior, not an
+optimization: skipping it changes the function.
+
+Schedules differ by backend and are recorded with each
+implementation: the Metal implementation fuses this residual mixing
+(upstream HEAD 2bd4d6aa is exactly that fusion); the CPU graph
+implementation computes the same mixing as ordinary graph
+operations. Behavior is the declaration; fusion is a schedule.
+# Implementation — the published MLX runner (reference)
+
+Where it lives: this fork, mlxrunner/model/inkling2 (model,
+attention, experts, weights, config, vision, draft, residual, conv,
+projection), with the importer at create/inkling2.go and shared quant
+facts at mlx/quant. The converter classifies each expert bank by its
+stored dtypes (NVFP4: weights uint8, scales E4M3; MXFP8: weights
+E4M3, scales uint8) and rejects anything else.
+
+Platforms as published: macOS on Metal (backends metal_v3,
+metal_v4) and Linux/Windows on CUDA 13 (backend cuda_v13). The
+Ollama library package for inkling-2-mini ships manifests for macOS
+(32 GB and up) and DGX Spark only — no linux/amd64 manifest exists
+upstream, which is the gap the litmus exists to close.
+
+Kernel behavior: the mlx package carries per-backend GPU kernels
+(nvfp4 matmul, matvec and activation kernels; sorted-run MoE
+routing). A GPU kernel that cannot be created or launched on the
+running backend disables itself permanently, and the model falls
+back to computing the same outputs with graph operations. The
+fallback is part of the published implementation's behavior — it is
+what makes the CPU implementation below an inflation of this
+declaration rather than a port.
+# Implementation — Linux CPU (this fork's patch)
+
+The missing platform kernel for the ranch is a CPU kernel: the
+fleet has no discrete GPUs. The patch adds it where the fork's build
+system dispatches MLX backends:
+
+  cmake/local.cmake — a "cpu" branch in the OLLAMA_MLX_BACKENDS
+    dispatch, calling ollama_add_mlx_build(cpu, PRESET mlx_cpu,
+    RUNNER_DIR mlx_cpu) and appending target ollama-mlx-cpu.
+  cmake/mlx/CMakePresets.json — an mlx_cpu preset: inherits the
+    default preset, sets MLX_BUILD_CUDA=OFF and MLX_BUILD_METAL=OFF
+    and OLLAMA_RUNNER_DIR=mlx_cpu. With CUDA and Metal off, MLX
+    builds its CPU backend; libmlxc.so is produced for Linux.
+  kernels/inkling2/ — this declaration artifact.
+
+One Go source change proved necessary, in mlx/io.go: the
+safetensors loader chose its load stream by operating system —
+CPU stream on macOS, GPU stream everywhere else. On a CPU-only
+build the GPU stream does not exist, the native load fails, and
+the loader's iterator swallows the error, so every weight blob
+silently yields zero tensors and the model reports its first
+tensor missing. The fix selects the CPU stream whenever no GPU
+device is available (GPUIsAvailable), which is the same fact the
+rest of the package already branches on. With that, the MLX
+loader accepts the CPU variant it dlopens, and the inkling2
+model's GPU kernels decline to launch on the CPU backend while
+the graph fallbacks execute — including NVFP4 and MXFP8
+dequantization, performed in graph operations from the weights'
+shipped packed form.
+
+NVFP4 route chosen: in-kernel (in-graph) dequantization. The weights
+stay NVFP4/MXFP8-packed in memory and in the model store; the
+dequantization rule of scroll 1.1.1/1.1.1/1.1.6 is applied as the
+graph computes. Stated cost: dequantization arithmetic on every
+matmul, paid in tokens per second, in exchange for zero precision
+change and the smallest memory footprint. The build-time conversion
+alternative (materialize bf16 experts ahead of time, roughly four
+times the expert bytes) and requantization (rejected outright: it
+would change the trained precision, and the release is the
+precision) are costed in the litmus run record.
+# Run record — first inflation
+
+2026-11-21, elven-path (ranch node, Linux x86_64, 16 cores, 30 GB
+RAM, no discrete GPU — AMD Phoenix iGPU only, unused). Backend:
+MLX CPU (libmlxc.so built by this fork's patch, MLX version
+0.32.4-82-gfc344c9, device=cpu per the runner's own log).
+
+Before the patch's payload existed, the same binary answered the
+create with: "MLX runtime is not available: failed to load MLX
+dynamic library". After: the create imported inkling-2-mini with
+1204 layers (19 GB in the model store), the runner loaded 1244
+tensors from the manifest, and the model served through the normal
+API on the node's ollama port.
+
+Prompt 1 (raw completion, /api/generate): "What is the capital of
+France? Answer in one sentence."
+Output began: ", Paris is the capital of France." and continued
+in a self-generated question-and-answer pattern, answering its own
+follow-ups correctly (Washington, D.C.; Ottawa; Berlin; ...),
+consuming the full 120-token allowance without an end-of-sequence
+— ordinary raw-completion behavior without a chat template.
+Coherent and factually correct throughout the sampled output.
+Decode: 120 tokens in 672.0 s = 0.18 tokens per second. Prompt
+processing: 12 tokens in about 25 s. Runner memory: 20.3 GB RSS
+(the 19.5 GB packed weights plus caches and activations) against
+the node's 30 GB.
+
+Kernel-optimization look (the standing rule: model access always
+pairs with one):
+  - Dequantization strategy. Adopted: in-graph dequantization from
+    the shipped packed form (zero precision change). Measured cost:
+    it is the decode bottleneck — the graph fallback re-dequantizes
+    the selected experts on every token (48 layer visits x top-8
+    experts x about 8M parameters is roughly 3.1B parameters
+    dequantized per token), which with the unfused graph schedule
+    yields the 0.18 tok/s above. Rejected: build-time bf16
+    materialization — the experts are 24.46B parameters, 48.9 GB
+    at bf16, more RAM than any ranch node has (fleet maximum
+    44 GB; this node 30 GB). Rejected: requantization — it would
+    change the trained precision; the release is the precision.
+  - Loop reuse. The graph already reuses the same physical weights
+    across the 3 passes (that is the architecture), but per-visit
+    cache ownership means key/value state is NOT shared across
+    passes: 48 visits x 8 KV heads x 128 head_dim x 2 (K and V) x
+    2 bytes is about 192 KB of cache per token. The residual-mix
+    fusion the Metal backend has (upstream HEAD) has no CPU
+    counterpart; the CPU path computes the same mixing as ordinary
+    graph operations.
+  - MoE routing. Top-8 of 128 experts per token per visit; the GPU
+    sorted-run routing kernel self-disables on CPU and the graph
+    fallback computes the same selection. Expert weight traffic per
+    token is about 1.7 GB packed; the cost is dominated not by the
+    traffic but by the per-token dequantization above.
+  - Next optimization, sized but not built: a dequantized-expert
+    cache. The node has about 8 GB of headroom over the packed
+    weights; one expert in bf16 is about 16 MB, so the headroom
+    holds roughly 500 of the 6144 expert slots, and routing locality
+    across a sequence is high. Expected to remove most of the
+    repeated dequantization; unmeasured until built.
+  - Observed wart: the CPU variant's install directory also carries
+    about 600 MB of bundled CUDA redistributable libraries (an
+    upstream MLX install rule); the CPU backend neither loads nor
+    needs them.
+
+This scroll is appended to at each inflation: node, backend,
+prompts, outputs, tokens per second, memory footprint, and the
+kernel-optimization measurements.

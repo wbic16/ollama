@@ -18,7 +18,12 @@ type SafetensorsFile struct {
 }
 
 func loadSafetensorsStream() C.mlx_stream {
-	if runtime.GOOS == "darwin" {
+	// The GPU stream only exists when a GPU device does. On a
+	// CPU-only build (no Metal, no CUDA) requesting it makes
+	// mlx_load_safetensors fail, and Load above swallows that
+	// error, so every blob silently yields zero tensors. Load on
+	// the CPU stream whenever no GPU is available.
+	if runtime.GOOS == "darwin" || !GPUIsAvailable() {
 		return C.mlx_default_cpu_stream_new()
 	}
 	return C.mlx_default_gpu_stream_new()

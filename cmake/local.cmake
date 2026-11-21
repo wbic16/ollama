@@ -8,7 +8,7 @@ include(ExternalProject)
 
 set(OLLAMA_LLAMA_BACKENDS "" CACHE STRING
     "Semicolon-separated llama-server GPU backends to build: cuda_v12;cuda_v13;rocm_v7_1;rocm_v7_2;vulkan;cuda_jetpack5;cuda_jetpack6")
-set(_ollama_mlx_backends_doc "Semicolon-separated MLX backends to build: cuda_v13;metal_v3;metal_v4")
+set(_ollama_mlx_backends_doc "Semicolon-separated MLX backends to build: cuda_v13;metal_v3;metal_v4;cpu")
 set(OLLAMA_VERSION "0.0.0" CACHE STRING "Ollama version embedded in the local Go binary")
 set(OLLAMA_GO_EXTRA_LDFLAGS "" CACHE STRING "Additional flags for the Ollama Go linker")
 set(OLLAMA_PAYLOAD_INSTALL_PREFIX "${CMAKE_BINARY_DIR}" CACHE PATH
@@ -976,6 +976,11 @@ foreach(_backend IN LISTS OLLAMA_MLX_BACKENDS)
                 "OLLAMA_MLX_BACKENDS=metal_v4 requires the macOS 26.2 SDK. "
                 "Install a newer Xcode or use OLLAMA_MLX_BACKENDS=metal_v3.")
         endif()
+    elseif(_backend STREQUAL "cpu")
+        ollama_add_mlx_build(cpu
+            PRESET mlx_cpu
+            RUNNER_DIR mlx_cpu)
+        list(APPEND _mlx_targets ollama-mlx-cpu)
     else()
         message(FATAL_ERROR
             "Unknown OLLAMA_MLX_BACKENDS entry '${_backend}'")

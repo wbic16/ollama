@@ -60,6 +60,16 @@
         "CMAKE_OSX_DEPLOYMENT_TARGET": "26.2",
         "OLLAMA_RUNNER_DIR": "mlx_metal_v4"
       }
+    },
+    {
+      "name": "mlx_cpu",
+      "inherits": [ "default" ],
+      "binaryDir": "${sourceDir}/../../build/mlx_cpu",
+      "cacheVariables": {
+        "MLX_BUILD_CUDA": "OFF",
+        "MLX_BUILD_METAL": "OFF",
+        "OLLAMA_RUNNER_DIR": "mlx_cpu"
+      }
     }
   ],
   "buildPresets": [
@@ -86,6 +96,11 @@
     {
       "name": "mlx_metal_v4",
       "configurePreset": "mlx_metal_v4",
+      "targets": [ "mlx", "mlxc" ]
+    },
+    {
+      "name": "mlx_cpu",
+      "configurePreset": "mlx_cpu",
       "targets": [ "mlx", "mlxc" ]
     }
   ]
